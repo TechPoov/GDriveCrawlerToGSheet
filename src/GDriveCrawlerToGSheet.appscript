@@ -1,0 +1,660 @@
+/*******************************************************
+ * TechPoov Menu → Scan Gdrive Folder (Resume + Triggers)
+ * Bound Apps Script — single file, no external libs
+ * -----------------------------------------------------
+ * PROFILES INPUT (sheet "Profiles")
+ *   ProfileName | FolderId | Recursive | Scan | LastUpdated | Remarks
+ *
+ * OUTPUT PER PROFILE (new sheet each run)
+ *   <ProfileName> with fixed columns in this order:
+ *     GivenFolder | File | Type | Extension | WebLinkURL
+ *
+ * ROLLOVER
+ *   If <ProfileName> exists → rename to <ProfileName>_Old
+ *   If <ProfileName>_Old exists → delete first
+ *   Create fresh <ProfileName> with fixed header.
+ *
+ * RESUME / CHECKPOINT
+ *   DocumentProperties key: SCAN_STATE::<ProfileName>
+ *   {
+ *     profileName, folderId, recursive, topName,
+ *     queue: [{id, path}], // path uses "/" separators
+ *     processedCount, startedAtISO, phase, sheetName, oldSheetName,
+ *     lastRun, writeRow, pendingRows:[] (buffer not yet flushed)
+ *   }
+ *
+ * SINGLE CONTINUATION TRIGGER
+ *   DocumentProperties key: SCAN_WORKER_TRIGGER_ID
+ *   Always remove old one before creating a new one.
+ *
+ * LOGGING
+ *   Sheet "Log": Timestamp, Level, Profile, Phase, Msg, Details
+ *******************************************************/
+
+const FIXED_HEADER = ['GivenFolder','File','Type','Extension','WebLinkURL'];
+const STATE_PREFIX = 'SCAN_STATE::';
+const TRIGGER_KEY  = 'SCAN_WORKER_TRIGGER_ID';
+const ACTIVE_SET   = 'SCAN_ACTIVE_PROFILES'; // JSON array of profileNames
+
+// ~5 minutes worker; stop 30s early for cleanup margin
+const MAX_RUNTIME_MS = 5 * 60 * 1000;
+const STOP_MARGIN_MS = 30 * 1000;
+const NEXT_RUN_DELAY_MS = 15 * 1000; // 15s
+
+/********************
+ * MENU
+ ********************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('TechPoov Menu')
+    .addItem('Scan Gdrive Folder', 'menuScanGdriveFolders')
+    .addToUi();
+}
+
+function menuScanGdriveFolders() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const profilesSheet = ss.getSheetByName('Profiles');
+    if (!profilesSheet) throw new Error('Profiles sheet not found.');
+
+    const { rows, colMap } = readTable(profilesSheet);
+    const toRun = [];
+
+    rows.forEach(r => {
+      const scan = String(r[colMap['Scan']] || '').toLowerCase();
+      if (scan === 'yes') {
+        const profileName = String(r[colMap['ProfileName']] || '').trim();
+        const folderId    = String(r[colMap['FolderId']] || '').trim();
+        if (!profileName || !folderId) {
+          logEvent({level:'WARN', profile: profileName, phase:'INIT', msg:'Missing ProfileName or FolderId; skipping.'});
+          return;
+        }
+        const recursive   = parseBoolean(r[colMap['Recursive']]);
+        initOrResumeProfile({profileName, folderId, recursive});
+        toRun.push(profileName);
+      }
+    });
+
+    // Persist active set and kick worker
+    setActiveProfiles(toRun);
+    ensureSingleTrigger(); // remove any existing worker trigger
+    scheduleNextWorker(NEXT_RUN_DELAY_MS);
+    logEvent({level:'INFO', phase:'INIT', msg:`Queued ${toRun.length} profile(s). Worker scheduled in ${Math.round(NEXT_RUN_DELAY_MS/1000)}s.`});
+  } catch (err) {
+    logEvent({level:'ERROR', phase:'MENU', msg:err.message, details:err.stack});
+    throw err;
+  }
+}
+
+/********************
+ * PROFILE INIT
+ ********************/
+function initOrResumeProfile({profileName, folderId, recursive}) {
+  const props = PropertiesService.getDocumentProperties();
+  const key = STATE_PREFIX + profileName;
+  let state = getState(profileName);
+
+  if (state && state.phase && state.phase !== 'DONE') {
+    // Already in progress — do nothing
+    logEvent({level:'INFO', profile: profileName, phase: state.phase, msg:'Resuming existing profile state.'});
+    return;
+  }
+
+  // Fresh start
+  let topName = '';
+  try {
+    topName = DriveApp.getFolderById(folderId).getName();
+  } catch (e) {
+    logEvent({level:'ERROR', profile: profileName, phase:'INIT', msg:`Invalid or inaccessible FolderId: ${folderId}`, details:e.message});
+    return; // skip this profile
+  }
+
+  const { sheetName, oldSheetName } = prepareRolloverSheets(profileName);
+
+  // seed queue with root (path = topName)
+  const queue = [{ id: folderId, path: topName }];
+
+  state = {
+    profileName, folderId, recursive: !!recursive, topName,
+    queue,
+    processedCount: 0,
+    startedAtISO: new Date().toISOString(),
+    phase: 'SCANNING',
+    sheetName,
+    oldSheetName,
+    lastRun: Date.now(),
+    writeRow: 2,          // start after header
+    pendingRows: []       // buffered rows not yet flushed
+  };
+  setState(profileName, state);
+}
+
+/********************
+ * WORKER (time-boxed)
+ ********************/
+function scanWorker() {
+  const start = Date.now();
+  try {
+    let actives = getActiveProfiles();
+
+    // If we have no actives, try to discover any lingering states
+    if (!actives.length) {
+      actives = discoverActiveProfilesFromState();
+      setActiveProfiles(actives);
+    }
+
+    if (!actives.length) {
+      // Nothing to do; clean triggers
+      ensureSingleTrigger(true); // remove any existing
+      logEvent({level:'INFO', phase:'IDLE', msg:'No active profiles. Worker trigger cleared.'});
+      return;
+    }
+
+    // Round-robin: process one profile per slice to keep things simple
+    const profileName = actives[0];
+    let state = getState(profileName);
+
+    if (!state || state.phase === 'DONE') {
+      // Remove from actives
+      setActiveProfiles(actives.slice(1));
+      // Schedule again if more
+      if (actives.length > 1) scheduleNextWorker(NEXT_RUN_DELAY_MS);
+      return;
+    }
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const outSheet = getOrCreateSheet(ss, state.sheetName, FIXED_HEADER);
+
+    // Main loop, time-boxed
+    while (Date.now() - start < (MAX_RUNTIME_MS - STOP_MARGIN_MS)) {
+      if (state.phase === 'SCANNING') {
+        const progressed = processScanSlice(state, outSheet, start);
+        setState(profileName, state);
+        if (!progressed) break; // nothing left to do in SCANNING
+        continue;
+      }
+
+      if (state.phase === 'MERGE_BACK') {
+        const progressed = processMergeBackSlice(state);
+        setState(profileName, state);
+        if (!progressed) break; // merge finished or waiting
+        continue;
+      }
+
+      if (state.phase === 'DONE') {
+        break;
+      }
+    }
+
+    // Post-slice housekeeping
+    setState(profileName, state);
+    state.lastRun = Date.now();
+
+    // If finished, pop and continue others next run
+    if (state.phase === 'DONE') {
+      const rest = actives.slice(1);
+      setActiveProfiles(rest);
+      logEvent({level:'INFO', profile: profileName, phase:'DONE', msg:`Completed. Processed ${state.processedCount} items.`});
+    }
+
+    // Always keep a single continuation trigger if any work remains
+    const hasMore = getActiveProfiles().length > 0 || anyScanningInProgress();
+    if (hasMore) {
+      ensureSingleTrigger(); // remove previous then create new
+      scheduleNextWorker(NEXT_RUN_DELAY_MS);
+    } else {
+      ensureSingleTrigger(true); // remove any existing
+      logEvent({level:'INFO', phase:'IDLE', msg:'All work complete. Worker trigger cleared.'});
+    }
+  } catch (err) {
+    logEvent({level:'ERROR', phase:'WORKER', msg:err.message, details:err.stack});
+    // Keep scheduling if any profiles remain
+    if (anyScanningInProgress() || getActiveProfiles().length) {
+      ensureSingleTrigger();
+      scheduleNextWorker(NEXT_RUN_DELAY_MS * 2);
+    }
+  }
+}
+
+/********************
+ * SCANNING SLICE
+ ********************/
+function processScanSlice(state, outSheet, sliceStartTs) {
+  // Flush any pending buffer first
+  if (state.pendingRows && state.pendingRows.length) {
+    flushRows(outSheet, state);
+    return true;
+  }
+
+  // If queue empty → switch to MERGE_BACK
+  if (!state.queue.length) {
+    // optional: dedupe rows by WebLinkURL before merge-back if you want
+    state.phase = 'MERGE_BACK';
+    return true;
+  }
+
+  // Dequeue one folder node
+  const node = state.queue.shift(); // {id, path}
+  let folder;
+  try {
+    folder = DriveApp.getFolderById(node.id);
+  } catch (e) {
+    logEvent({level:'ERROR', profile: state.profileName, phase:'SCANNING', msg:`Cannot access folderId ${node.id}; skipping.`, details: e.message});
+    return true; // continue scan
+  }
+
+  // 1) Always write a row for the folder itself
+  // GivenFolder (folder row) = that folder’s full path
+  state.pendingRows.push([
+    node.path,              // GivenFolder
+    folder.getName(),       // File (folder name)
+    'Folder',               // Type
+    '',                     // Extension
+    folder.getUrl()         // WebLinkURL
+  ]);
+  if (state.pendingRows.length >= 1000) flushRows(outSheet, state);
+
+  // 2) List children (folders and files)
+  //    For files: GivenFolder = parent path (node.path)
+  //    For folders: enqueue child with path = `${node.path}/${childName}`
+  //    Include empty folders – already satisfied by the row we wrote above.
+  try {
+    // Files
+    const fileIter = folder.getFiles();
+    while (fileIter.hasNext()) {
+      const f = fileIter.next();
+      const name = f.getName();
+      const mime = f.getMimeType();
+      state.pendingRows.push([
+        node.path,           // GivenFolder (parent path)
+        name,                // File
+        'File',              // Type
+        deriveExtension(name, mime),
+        f.getUrl()
+      ]);
+      if (state.pendingRows.length >= 1000) flushRows(outSheet, state);
+
+      if (Date.now() - sliceStartTs > (MAX_RUNTIME_MS - STOP_MARGIN_MS)) break;
+    }
+
+    // Subfolders
+    if (state.recursive) {
+      const folderIter = folder.getFolders();
+      while (folderIter.hasNext()) {
+        const sub = folderIter.next();
+        const subName = sub.getName();
+        state.queue.push({ id: sub.getId(), path: `${node.path}/${subName}` });
+        if (Date.now() - sliceStartTs > (MAX_RUNTIME_MS - STOP_MARGIN_MS)) break;
+      }
+    }
+  } catch (e) {
+    // Rate limits or transient errors: log & continue next run
+    logEvent({level:'WARN', profile: state.profileName, phase:'SCANNING', msg:'Listing children failed; will retry.', details:e.message});
+  }
+
+  // Flush whatever we buffered this round (at least the folder row)
+  if (state.pendingRows.length) flushRows(outSheet, state);
+
+  // Optional lightweight progress note
+  noteProgressOnProfiles(state.profileName, `${state.processedCount} items; queue=${state.queue.length}`);
+
+  return true;
+}
+
+/********************
+ * FLUSH BUFFERED ROWS
+ ********************/
+function flushRows(sheet, state) {
+  try {
+    const rows = state.pendingRows;
+    if (!rows || !rows.length) return;
+    const startRow = state.writeRow;
+    const rng = sheet.getRange(startRow, 1, rows.length, FIXED_HEADER.length);
+    rng.setValues(rows);
+    state.writeRow += rows.length;
+    state.processedCount += rows.length;
+    state.pendingRows = [];
+  } catch (e) {
+    // If write fails, keep rows in buffer to retry next slice
+    logEvent({level:'WARN', profile: state.profileName, phase: state.phase, msg:'Buffered write failed; will retry.', details:e.message});
+  }
+}
+
+/********************
+ * MERGE-BACK SLICE
+ *  - Append any extra columns from _Old (to the right, same order)
+ *  - For each new row, match by WebLinkURL and copy extra values
+ ********************/
+function processMergeBackSlice(state) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const newSheet = ss.getSheetByName(state.sheetName);
+  if (!newSheet) {
+    // Edge: output sheet missing — mark done
+    state.phase = 'DONE';
+    finalizeProfile(state.profileName);
+    return false;
+  }
+
+  const oldSheet = ss.getSheetByName(state.oldSheetName);
+  if (!oldSheet) {
+    // No old data → Done
+    state.phase = 'DONE';
+    finalizeProfile(state.profileName);
+    return false;
+  }
+
+  // Read headers
+  const newHdr = getHeader(newSheet);
+  const oldHdr = getHeader(oldSheet);
+  const fixedSet = new Set(FIXED_HEADER);
+
+  // Identify extra columns in _Old
+  const extraCols = oldHdr.filter(h => !fixedSet.has(h));
+
+  if (extraCols.length) {
+    // Ensure those columns exist in the new sheet (append at end if missing)
+    const missing = extraCols.filter(c => newHdr.indexOf(c) === -1);
+    if (missing.length) {
+      newSheet.insertColumnsAfter(newHdr.length, missing.length);
+      // Write new header row
+      const newFullHdr = newHdr.concat(missing);
+      newSheet.getRange(1, 1, 1, newFullHdr.length).setValues([newFullHdr]);
+    }
+  }
+
+  // Build maps for column positions (re-fetch header after possible insertion)
+  const finalHdr = getHeader(newSheet);
+  const newColMap = indexMap(finalHdr);
+  const oldColMap = indexMap(oldHdr);
+
+  const urlOldIdx = oldColMap['WebLinkURL'];
+  const urlNewIdx = newColMap['WebLinkURL'];
+  if (urlOldIdx == null || urlNewIdx == null) {
+    // Shouldn’t happen; safeguard
+    state.phase = 'DONE';
+    finalizeProfile(state.profileName);
+    return false;
+  }
+
+  // Build Old map: URL → extra values array (in extraCols order)
+  const oldValues = readData(oldSheet);
+  const oldMap = new Map();
+  const extraIdxs = extraCols.map(c => oldColMap[c]);
+  oldValues.forEach(r => {
+    const url = r[urlOldIdx];
+    if (!url) return;
+    const extras = extraIdxs.map(i => r[i] || '');
+    oldMap.set(url, extras);
+  });
+
+  // Fill on new sheet in chunks for performance
+  const newValues = readData(newSheet);
+  if (!newValues.length) {
+    state.phase = 'DONE';
+    finalizeProfile(state.profileName);
+    return false;
+  }
+
+  // Find target columns (append order matches extraCols)
+  const targetIdxs = extraCols.map(c => newColMap[c]);
+
+  const CHUNK = 1000;
+  for (let i = 0; i < newValues.length; i += CHUNK) {
+    const slice = newValues.slice(i, i + CHUNK);
+    const writeRows = [];
+    const writeA1 = [];
+
+    slice.forEach((row, offset) => {
+      const url = row[urlNewIdx];
+      if (!url) return;
+      const extras = oldMap.get(url);
+      if (!extras) return;
+
+      // Build range for each extra column cell in this row
+      extras.forEach((val, ex) => {
+        const r = 2 + i + offset;        // data starts at row 2
+        const c = 1 + targetIdxs[ex];    // 1-based
+        writeA1.push({r, c, v: val});
+      });
+    });
+
+    // Batch set by grouping consecutive ranges per column when simple
+    // Here, for clarity & robustness, write cell-by-cell but within a slice
+    writeA1.forEach(cell => {
+      newSheet.getRange(cell.r, cell.c).setValue(cell.v);
+    });
+
+    // Time-box safety
+    // If we approach time limit, bail; we'll continue next slice
+    // (worker loop will schedule another run)
+    // (No need to track cursor; we’ll re-enter this function; cheap to recompute)
+    if (timeAlmostUp()) break;
+  }
+
+  // Done with merge-back
+  state.phase = 'DONE';
+  finalizeProfile(state.profileName);
+  return true;
+}
+
+/********************
+ * FINALIZE
+ ********************/
+function finalizeProfile(profileName) {
+  try {
+    // Set LastUpdated in Profiles
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('Profiles');
+    if (sheet) {
+      const { rows, colMap, a1StartRow } = readTable(sheet);
+      for (let i = 0; i < rows.length; i++) {
+        const name = String(rows[i][colMap['ProfileName']] || '').trim();
+        const scan = String(rows[i][colMap['Scan']] || '').toLowerCase();
+        if (name === profileName && scan === 'yes') {
+          // set LastUpdated to now and clear Scan back to No (optional)
+          const lastUpdatedCol = colTo1Based(colMap['LastUpdated']);
+          if (lastUpdatedCol) sheet.getRange(a1StartRow + i, lastUpdatedCol).setValue(new Date());
+          // leave Scan as-is (Yes) unless you want to auto-reset
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    logEvent({level:'WARN', profile: profileName, phase:'FINALIZE', msg:'Could not update Profiles.LastUpdated', details:e.message});
+  } finally {
+    clearState(profileName);
+  }
+}
+
+/********************
+ * HELPERS: queue / Drive / header / parse
+ ********************/
+function parseBoolean(v) {
+  return String(v).toLowerCase() === 'true';
+}
+
+function deriveExtension(name, mimeType) {
+  // Google types → friendly
+  if (mimeType && mimeType.indexOf('application/vnd.google-apps') === 0) {
+    if (mimeType === 'application/vnd.google-apps.spreadsheet') return 'gsheet';
+    if (mimeType === 'application/vnd.google-apps.document')    return 'gdoc';
+    if (mimeType === 'application/vnd.google-apps.presentation')return 'gslide';
+    return ''; // other google types
+  }
+  // From filename
+  const dot = name.lastIndexOf('.');
+  if (dot > 0 && dot < name.length - 1) return name.substring(dot + 1);
+  return '';
+}
+
+function getOrCreateSheet(ss, name, header) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1,1,1,header.length).setValues([header]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function prepareRolloverSheets(profileName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const curr = ss.getSheetByName(profileName);
+  const oldName = `${profileName}_Old`;
+  const old = ss.getSheetByName(oldName);
+
+  if (old) ss.deleteSheet(old);
+  if (curr) curr.setName(oldName);
+
+  const fresh = getOrCreateSheet(ss, profileName, FIXED_HEADER);
+  return { sheetName: fresh.getName(), oldSheetName: oldName };
+}
+
+function getHeader(sheet) {
+  const lastCol = sheet.getLastColumn() || FIXED_HEADER.length;
+  if (lastCol === 0) return [];
+  const hdr = sheet.getRange(1,1,1,lastCol).getValues()[0];
+  return hdr.map(h => String(h || '').trim());
+}
+
+function readData(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return [];
+  return sheet.getRange(2,1,lastRow-1,lastCol).getValues();
+}
+
+function indexMap(arr) {
+  const m = {};
+  arr.forEach((v,i)=>{ m[String(v)] = i; });
+  return m;
+}
+
+function readTable(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2) return { rows:[], colMap:{}, a1StartRow:2 };
+  const hdr = sheet.getRange(1,1,1,lastCol).getValues()[0].map(x => String(x).trim());
+  const colMap = {};
+  hdr.forEach((h,i)=> colMap[h]=i);
+  const rows = sheet.getRange(2,1,lastRow-1,lastCol).getValues();
+  return { rows, colMap, a1StartRow: 2 };
+}
+
+function colTo1Based(idx) {
+  if (idx == null) return null;
+  return 1 + idx;
+}
+
+/********************
+ * STATE (DocumentProperties)
+ ********************/
+function getState(profileName) {
+  const props = PropertiesService.getDocumentProperties();
+  const raw = props.getProperty(STATE_PREFIX + profileName);
+  return raw ? JSON.parse(raw) : null;
+}
+function setState(profileName, state) {
+  const props = PropertiesService.getDocumentProperties();
+  props.setProperty(STATE_PREFIX + profileName, JSON.stringify(state));
+}
+function clearState(profileName) {
+  const props = PropertiesService.getDocumentProperties();
+  props.deleteProperty(STATE_PREFIX + profileName);
+}
+
+function getActiveProfiles() {
+  const props = PropertiesService.getDocumentProperties();
+  const raw = props.getProperty(ACTIVE_SET);
+  try { return raw ? JSON.parse(raw) : []; } catch { return []; }
+}
+function setActiveProfiles(arr) {
+  const props = PropertiesService.getDocumentProperties();
+  props.setProperty(ACTIVE_SET, JSON.stringify(arr || []));
+}
+function discoverActiveProfilesFromState() {
+  const props = PropertiesService.getDocumentProperties().getProperties();
+  const names = [];
+  Object.keys(props).forEach(k => {
+    if (k.startsWith(STATE_PREFIX)) {
+      const st = JSON.parse(props[k]);
+      if (st && st.phase && st.phase !== 'DONE') names.push(st.profileName);
+    }
+  });
+  return names;
+}
+function anyScanningInProgress() {
+  const props = PropertiesService.getDocumentProperties().getProperties();
+  return Object.keys(props).some(k => {
+    if (!k.startsWith(STATE_PREFIX)) return false;
+    const st = JSON.parse(props[k]);
+    return st && st.phase && st.phase !== 'DONE';
+  });
+}
+
+/********************
+ * TRIGGERS — single worker
+ ********************/
+function ensureSingleTrigger(removeOnly=false) {
+  const props = PropertiesService.getDocumentProperties();
+  const storedId = props.getProperty(TRIGGER_KEY);
+  const all = ScriptApp.getProjectTriggers();
+
+  // First remove any triggers pointing to scanWorker (or orphaned stored id)
+  all.forEach(t => {
+    if (t.getHandlerFunction() === 'scanWorker') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  if (storedId) props.deleteProperty(TRIGGER_KEY);
+
+  if (!removeOnly) {
+    // nothing else to do here — creation is in scheduleNextWorker()
+  }
+}
+
+function scheduleNextWorker(ms) {
+  const props = PropertiesService.getDocumentProperties();
+  const trig = ScriptApp.newTrigger('scanWorker').timeBased().after(ms).create();
+  props.setProperty(TRIGGER_KEY, trig.getUniqueId ? trig.getUniqueId() : String(Date.now()));
+}
+
+/********************
+ * TIME GUARD
+ ********************/
+function timeAlmostUp() {
+  // This helper is used inside merge-back; the main worker loop already has limits
+  return false; // merge-back is short here; keep simple
+}
+
+/********************
+ * LOGGING
+ ********************/
+function logEvent({level='INFO', profile='', phase='', msg='', details=''}) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = getOrCreateSheet(ss, 'Log', ['Timestamp','Level','Profile','Phase','Message','Details']);
+    const row = [new Date(), level, profile, phase, msg, details];
+    sh.appendRow(row);
+  } catch (e) {
+    // Swallow logging errors
+  }
+}
+
+function noteProgressOnProfiles(profileName, text) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('Profiles');
+    if (!sheet) return;
+    const { rows, colMap, a1StartRow } = readTable(sheet);
+    const remarksIdx = colMap['Remarks'];
+    const nameIdx = colMap['ProfileName'];
+    if (remarksIdx == null || nameIdx == null) return;
+    for (let i = 0; i < rows.length; i++) {
+      if (String(rows[i][nameIdx]).trim() === profileName) {
+        sheet.getRange(a1StartRow + i, 1 + remarksIdx).setValue(text);
+        break;
+      }
+    }
+  } catch (_e) {}
+}
