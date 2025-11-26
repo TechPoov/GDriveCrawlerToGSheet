@@ -1,6 +1,8 @@
 <h1><strong>GDriveCrawlerToGSheet</strong></h1>
-![GitHub all releases](https://img.shields.io/github/downloads/TechPoov/GDriveCrawlerToGSheet/total.svg)
 
+
+&nbsp;   <br>
+![GitHub all releases](https://img.shields.io/github/downloads/TechPoov/GDriveCrawlerToGSheet/total.svg)
 
 <p><em>A simple Google Apps Script tool that scans your Google Drive and lists every folder and file into a clean, clickable Google Sheet.</em>
 
@@ -256,6 +258,7 @@
 ![GitHub all releases](https://img.shields.io/github/downloads/TechPoov/GDriveCrawlerToGSheet/total.svg)
 
 </p>
+
 
 
 
