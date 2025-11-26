@@ -180,7 +180,7 @@
 
 &nbsp;   <li>
 
-&nbsp;       <p>Open the tool link: Make Copy \&gt; <a target="\_blank" rel="noopener noreferrer nofollow" href="https://docs.google.com/spreadsheets/d/1UzSGfd5OrEbUCY6r\_Bzv9l3X53qX9YVF-J3dfbcprGQ/copy"><span style="color: rgb(17, 85, 204)">Link</span></a>
+&nbsp;       <p>Open the tool link: Make Copy \&gt; <a target="\_blank" rel="noopener noreferrer nofollow" href="https://docs.google.com/spreadsheets/d/1r__8IycyYnSbJ-3OiG_ldVw4kERZYJe3A4iHiMdVS8U/copy"><span style="color: rgb(17, 85, 204)">Link</span></a>
 
 &nbsp;       </p>
 
@@ -253,4 +253,5 @@
 &nbsp;   <br>
 
 </p>
+
 
