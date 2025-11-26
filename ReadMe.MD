@@ -251,7 +251,9 @@
 &nbsp;   <br>
 
 &nbsp;   <br>
+![GitHub all releases](https://img.shields.io/github/downloads/TechPoov/GDriveCrawlerToGSheet/total.svg)
 
 </p>
+
 
 
